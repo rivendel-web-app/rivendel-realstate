@@ -2,14 +2,83 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import streamlit_authenticator as stauth
 import bcrypt
+import requests
 
 st.set_page_config(page_title="Gestión e Históricos Inmobiliarios", page_icon="🏢", layout="wide")
 
 DB_PATH = 'modelo_definitivo.db'
-VALOR_UF_CLP = 40865.0
+
+# ------------------------------------------------------------------
+# OBTENCIÓN DINÁMICA DE LA UF (MINDICADOR.CL + EXPIRACIÓN A MEDIANOCHE + BBDD)
+# ------------------------------------------------------------------
+def obtener_segundos_hasta_medianoche() -> int:
+    ahora = datetime.now()
+    medianoche = datetime.combine(ahora.date() + timedelta(days=1), time.min)
+    segundos_restantes = int((medianoche - ahora).total_seconds())
+    return max(segundos_restantes, 60)
+
+def consultar_uf_mindicador():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS historico_uf (
+                fecha TEXT PRIMARY KEY,
+                valor REAL,
+                fecha_registro TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error gestionando tabla historico_uf: {e}")
+
+    try:
+        url = "https://mindicador.cl/api/uf"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            valor_api = float(data["serie"][0]["valor"])
+            fecha_api_raw = data["serie"][0]["fecha"][:10]
+            
+            fecha_dt = datetime.strptime(fecha_api_raw, '%Y-%m-%d')
+            fecha_display = fecha_dt.strftime('%d/%m/%Y')
+
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO historico_uf (fecha, valor, fecha_registro)
+                VALUES (?, ?, ?)
+            """, (fecha_api_raw, valor_api, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            conn.commit()
+            conn.close()
+
+            return valor_api, fecha_display
+    except Exception as e:
+        print(f"Error al obtener UF en línea: {e}")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT fecha, valor FROM historico_uf ORDER BY fecha DESC LIMIT 1")
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            fecha_dt = datetime.strptime(row[0], '%Y-%m-%d')
+            return float(row[1]), f"{fecha_dt.strftime('%d/%m/%Y')} (BBDD local)"
+    except Exception as e:
+        print(f"Error consultando fallback BBDD: {e}")
+
+    return 40865.0, datetime.now().strftime('%d/%m/%Y')
+
+@st.cache_data(ttl=obtener_segundos_hasta_medianoche())
+def get_uf_diaria():
+    return consultar_uf_mindicador()
+
+VALOR_UF_CLP, FECHA_UF_VALOR = get_uf_diaria()
 
 # ------------------------------------------------------------------
 # FUNCIONES DE SEGURIDAD Y AUDITORÍA
@@ -152,6 +221,31 @@ def safe_float(val):
     except:
         return 0.0
 
+def resetear_base_de_datos(username_admin):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Eliminar registros de las tablas operativas e históricas
+        cursor.execute("DELETE FROM canones_arriendo")
+        cursor.execute("DELETE FROM contratos_arriendo")
+        cursor.execute("DELETE FROM gastos_propiedad")
+        cursor.execute("DELETE FROM compras_financiamiento")
+        cursor.execute("DELETE FROM arrendatarios")
+        cursor.execute("DELETE FROM propiedades")
+        
+        # Reiniciar contadores de secuencias
+        cursor.execute("DELETE FROM sqlite_sequence WHERE name IN ('canones_arriendo', 'contratos_arriendo', 'gastos_propiedad', 'compras_financiamiento', 'arrendatarios', 'propiedades')")
+        
+        conn.commit()
+        conn.close()
+        
+        registrar_edicion(username_admin, None, "RESETEO_TOTAL", "Se eliminaron todos los datos de prueba del portafolio.")
+        return True
+    except Exception as e:
+        print(f"Error al resetear BBDD: {e}")
+        return False
+
 def cargar_datos_historicos(fecha_consulta):
     conn = sqlite3.connect(DB_PATH)
     str_fecha = fecha_consulta.strftime('%Y-%m-%d')
@@ -198,19 +292,9 @@ def cargar_datos_historicos(fecha_consulta):
         AND (c.fecha_fin IS NULL OR c.fecha_fin >= ?)
     LEFT JOIN arrendatarios a ON c.arrendatario_id = a.id
     LEFT JOIN canones_arriendo ca ON ca.contrato_id = c.id
-    WHERE (
-        EXISTS (
-            SELECT 1 FROM contratos_arriendo c_sub 
-            WHERE c_sub.propiedad_id = p.id AND c_sub.fecha_arriendo <= ?
-        )
-        OR EXISTS (
-            SELECT 1 FROM gastos_propiedad g_sub 
-            WHERE g_sub.propiedad_id = p.id AND g_sub.fecha_inicio <= ?
-        )
-    )
     ORDER BY p.id ASC
     """
-    df = pd.read_sql_query(query, conn, params=(str_fecha, str_fecha, str_fecha, str_fecha, str_fecha, str_fecha))
+    df = pd.read_sql_query(query, conn, params=(str_fecha, str_fecha, str_fecha, str_fecha))
     conn.close()
     
     df["Arriendo Total ($)"] = df["Arriendo Total (UF)"] * VALOR_UF_CLP
@@ -339,15 +423,24 @@ def cargar_excel_incremental(uploaded_file):
 # ------------------------------------------------------------------
 # INTERFAZ PRINCIPAL
 # ------------------------------------------------------------------
-col_tit, col_usr = st.columns([3, 1])
+col_tit, col_uf_info, col_usr = st.columns([2.5, 1.2, 1.3])
+
 with col_tit:
     st.markdown("<h1 style='font-size: 2.1rem; font-weight: 800; color: #0F172A; margin-bottom: 0px;'>🏢 Executive Real Estate Dashboard</h1>", unsafe_allow_html=True)
     st.caption("Sistema de Gestión Patrimonial e Histórico Inmobiliario")
 
+with col_uf_info:
+    st.markdown(f"""
+    <div style='background-color: #EFF6FF; border: 1px solid #BFDBFE; border-radius: 10px; padding: 10px 14px; text-align: center;'>
+        <div style='font-size: 0.75rem; font-weight: 700; color: #1E40AF; text-transform: uppercase;'>📈 UF Oficial al Día</div>
+        <div style='font-size: 1.25rem; font-weight: 800; color: #1E3A8A; margin: 2px 0;'>${VALOR_UF_CLP:,.2f} CLP</div>
+        <div style='font-size: 0.75rem; color: #3B82F6;'>🗓️ Fecha: <b>{FECHA_UF_VALOR}</b></div>
+    </div>
+    """, unsafe_allow_html=True)
+
 with col_usr:
     st.write(f"👤 **{user_info.get('name', username)}** ({user_role.upper()})")
     authenticator.logout('🚪 Cerrar Sesión', 'main')
-
 st.markdown("---")
 
 if "mensaje_exito" in st.session_state:
@@ -474,7 +567,7 @@ with tab_consulta:
                 xaxis=dict(showgrid=False, title=""),
                 yaxis=dict(title="")
             )
-            st.plotly_chart(fig_bar_edif, use_container_width=True)
+            st.plotly_chart(fig_bar_edif, use_container_width=True, config={'displayModeBar': False})
 
         with col_g2:
             df_cli = df_kpis.groupby("Arrendatario")["Arriendo Neto (UF)"].sum().reset_index()
@@ -494,7 +587,7 @@ with tab_consulta:
                 xaxis=dict(showgrid=False, title=""),
                 yaxis=dict(title="")
             )
-            st.plotly_chart(fig_bar_cli, use_container_width=True)
+            st.plotly_chart(fig_bar_cli, use_container_width=True, config={'displayModeBar': False})
 
         st.markdown("---")
 
@@ -604,7 +697,31 @@ if user_role == 'admin':
     with tab_mantenedor:
         st.subheader("🛠️ Mantenedor de Registro Histórico y Operativo")
         
-        with st.expander("📥 Carga Masiva de Nuevos Activos desde Excel", expanded=False):
+        # ------------------------------------------------------------------
+        # RESETEO Y CARGA INICIAL (SOLO ADMIN CON CONFIRMACIÓN)
+        # ------------------------------------------------------------------
+        with st.expander("🚨 Carga Inicial: Vaciar Base de Datos (Partir de Cero)", expanded=False):
+            st.warning("⚠️️ **Atención:** Esta opción vaciará la totalidad de las propiedades, contratos, gastos y cánones registrados para dar paso a la carga real. Los usuarios y logs de auditoría se mantendrán.")
+            
+            confirmar_check = st.checkbox("Entiendo el alcance y deseo eliminar la información actual de test.")
+            
+            if confirmar_check:
+                st.error("❓ **¿Estás seguro de que deseas vaciar la base de datos?** Esta operación no se puede deshacer.")
+                col_conf1, col_conf2 = st.columns([1, 4])
+                
+                with col_conf1:
+                    btn_reset_definitivo = st.button("🔥 Sí, Eliminar Todo", type="primary")
+                
+                if btn_reset_definitivo:
+                    if resetear_base_de_datos(username):
+                        st.session_state["mensaje_exito"] = "💥 Base de datos vaciada con éxito. Puedes proceder a cargar los datos reales del portafolio."
+                        st.rerun()
+                    else:
+                        st.error("❌ Ocurrió un error al intentar vaciar la base de datos.")
+
+        st.markdown("---")
+
+        with st.expander("📥 Carga Masiva de Activos desde Excel", expanded=False):
             st.markdown("Suba una planilla Excel (`Planilla Propiedades IA.xlsx`). El sistema registrará únicamente los **activos nuevos** por la combinación **`Edificio + Tipo + N° Propiedad`**.")
             file_excel = st.file_uploader("Seleccionar Planilla Excel:", type=["xlsx", "xls"])
             
