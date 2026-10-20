@@ -1,18 +1,22 @@
 import sqlite3
 import pandas as pd
 import streamlit as st
+import time
 from google import genai
 
-# Configuración de la página en Streamlit
 st.set_page_config(page_title="Asistente Beco IA", page_icon="🤖", layout="wide")
 
 st.title("🤖 Asistente Conversacional Beco Real Estate")
 st.write("Haz preguntas en lenguaje natural sobre el portafolio, ocupación o cánones de arriendo.")
 
-# 1. Inicializar cliente Gemini leyendo la clave de secrets
-client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+api_key = st.secrets.get("GEMINI_API_KEY")
 
-# 2. Función para obtener la estructura (esquema) de modelo_definitivo.db
+if not api_key:
+    st.error("No se encontró la clave GEMINI_API_KEY en .streamlit/secrets.toml")
+    st.stop()
+
+client = genai.Client(api_key=api_key)
+
 def obtener_esquema_db():
     conn = sqlite3.connect("modelo_definitivo.db")
     cursor = conn.cursor()
@@ -22,11 +26,9 @@ def obtener_esquema_db():
     esquema = "\n".join([t[0] for t in tablas if t[0] is not None])
     return esquema
 
-# 3. Función para ejecutar la consulta SQL de manera segura (solo lectura)
 def ejecutar_consulta_sql(sql_query):
     conn = sqlite3.connect("modelo_definitivo.db")
     try:
-        # Bloqueo de seguridad básico: solo permitir SELECT
         query_clean = sql_query.strip().upper()
         if not query_clean.startswith("SELECT"):
             return None, "Por seguridad, solo se permiten consultas de lectura (SELECT)."
@@ -38,28 +40,40 @@ def ejecutar_consulta_sql(sql_query):
         conn.close()
         return None, str(e)
 
-# 4. Historial de Chat
+def generar_contenido_con_fallback(prompt_texto):
+    # Lista de modelos en orden de prioridad
+    modelos = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    
+    for modelo in modelos:
+        try:
+            response = client.models.generate_content(
+                model=modelo,
+                contents=prompt_texto
+            )
+            return response.text
+        except Exception as e:
+            # Si da error 503 o no disponible, espera medio segundo y prueba el siguiente
+            time.sleep(0.5)
+            continue
+            
+    raise Exception("Los servidores de la IA están experimentando alta demanda. Por favor intenta en unos segundos.")
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Mostrar mensajes anteriores
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# 5. Entrada del usuario
-if prompt := st.chat_input("Ej: ¿Cuántas oficinas tenemos y cuál es su tasa de ocupación?"):
-    # Mostrar mensaje del usuario
+if prompt := st.chat_input("Ej: ¿Cuántas bodegas tengo?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Procesar respuesta con la IA
     with st.chat_message("assistant"):
         with st.spinner("Consultando la base de datos..."):
             esquema = obtener_esquema_db()
             
-            # Prompt de instrucción para el LLM
             system_prompt = f"""
             Eres un experto analista SQL para un sistema inmobiliario (Beco Real Estate).
             Dada la siguiente estructura de la base de datos SQLite:
@@ -75,31 +89,29 @@ if prompt := st.chat_input("Ej: ¿Cuántas oficinas tenemos y cuál es su tasa d
 
             full_prompt = f"{system_prompt}\n\nPregunta del usuario: {prompt}"
 
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=full_prompt
-            )
-            
-            sql_generada = response.text.strip().replace("```sql", "").replace("```", "").strip()
+            try:
+                texto_respuesta = generar_contenido_con_fallback(full_prompt)
+                sql_generada = texto_respuesta.strip().replace("```sql", "").replace("```", "").strip()
 
-            # Intentar ejecutar la consulta en la BBDD
-            if sql_generada.upper().startswith("SELECT"):
-                df_resultado, error = ejecutar_consulta_sql(sql_generada)
-                
-                if error:
-                    st.error(f"Error al ejecutar SQL: {error}")
-                    st.code(sql_generada, language="sql")
-                elif df_resultado is not None:
-                    st.write("📊 **Resultado:**")
-                    st.dataframe(df_resultado, use_container_width=True)
+                if sql_generada.upper().startswith("SELECT"):
+                    df_resultado, error = ejecutar_consulta_sql(sql_generada)
                     
-                    with st.expander("Ver consulta SQL generada"):
+                    if error:
+                        st.error(f"Error al ejecutar SQL: {error}")
                         st.code(sql_generada, language="sql")
-                    
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": f"He ejecutado la consulta para responder tu pregunta. Se encontraron {len(df_resultado)} registros."
-                    })
-            else:
-                st.write(response.text)
-                st.session_state.messages.append({"role": "assistant", "content": response.text})
+                    elif df_resultado is not None:
+                        st.write("📊 **Resultado:**")
+                        st.dataframe(df_resultado, use_container_width=True)
+                        
+                        with st.expander("Ver consulta SQL generada"):
+                            st.code(sql_generada, language="sql")
+                        
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": f"He ejecutado la consulta para responder tu pregunta. Se encontraron {len(df_resultado)} registros."
+                        })
+                else:
+                    st.write(texto_respuesta)
+                    st.session_state.messages.append({"role": "assistant", "content": texto_respuesta})
+            except Exception as ex:
+                st.warning(str(ex))
