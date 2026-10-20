@@ -42,7 +42,7 @@ def ejecutar_consulta_sql(sql_query):
 
 def generar_contenido_con_fallback(prompt_texto):
     # Lista de modelos en orden de prioridad
-    modelos = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    modelos = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     
     for modelo in modelos:
         try:
